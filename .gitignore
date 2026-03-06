@@ -126,3 +126,11 @@ temp_*/
 # srun
 *.out
 batchscript-*
+
+# gradio
+*.gradio
+
+# media
+*.mp4
+*.png
+*.zip

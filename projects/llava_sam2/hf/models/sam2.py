@@ -367,23 +367,47 @@ class SAM2(nn.Module):
         return pred_masks
 
     def train_postprocess(self, images, pred_masks, sample_idx):
-        output_masks = list()
+        # We use a dictionary to store frames by their index (e.g., {0: mask, 1: mask...})
+        # This prevents duplicate frames and makes sorting easy.
+        output_masks_dict = {} 
+        
         with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
             inference_state = self.sam2_model.init_state(images)
             obj_id = 101
-            # Add initial masks
+            
+            # 1. Add your manual masks/clicks as the 'anchors'
             for frame_id, mask in zip(sample_idx, pred_masks):
                 self.sam2_model.add_new_mask(inference_state, frame_id, obj_id, mask)
 
-            # Propagate masks through the video and save results
-            for frame_idx, object_ids, masks in self.sam2_model.propagate_in_video(inference_state):
-                # Extract mask for the tracked object (obj_id=1)
-                # mask_tensor = masks  # Shape: [1, 1, H, W]
-                # mask = (mask_tensor > 0.0).cpu()
-                output_masks.append(masks.cpu())
+            # We use the first selected frame as the starting point for both directions
+            base_frame = min(sample_idx)
 
-        output_masks = torch.cat(output_masks, dim=0)
-        return output_masks
+            # --- PASS 1: FORWARD ---
+            for f_idx, obj_ids, masks in self.sam2_model.propagate_in_video(
+                inference_state, 
+                start_frame_idx=base_frame, 
+                reverse=False
+            ):
+                output_masks_dict[f_idx] = masks.cpu()
+
+            # --- PASS 2: BACKWARD ---
+            # Tracks from frame 4 -> 0
+            if base_frame > 0:
+                for f_idx, obj_ids, masks in self.sam2_model.propagate_in_video(
+                    inference_state, 
+                    start_frame_idx=base_frame, 
+                    reverse=True
+                ):
+                    output_masks_dict[f_idx] = masks.cpu()
+
+        # 2. Final Assembly
+        # Sort the dictionary keys so the frames are in order (0, 1, 2... 48)
+        sorted_indices = sorted(output_masks_dict.keys())
+        
+        # Concatenate all frames into one big 49-frame tensor
+        final_masks = torch.cat([output_masks_dict[i] for i in sorted_indices], dim=0)
+        
+        return final_masks
 
     def get_sam2_embeddings_training_like(self, images, expand_size=1):
         # Step 1: inference the backbone with the images
@@ -4293,42 +4317,42 @@ class SAM2VideoPredictor(SAM2Base):
         obj_ids = inference_state["obj_ids"]
         num_frames = inference_state["num_frames"]
         batch_size = self._get_obj_num(inference_state)
+        
         if len(output_dict["cond_frame_outputs"]) == 0:
             raise RuntimeError("No points are provided; please add points first")
+            
         clear_non_cond_mem = self.clear_non_cond_mem_around_input and (
             self.clear_non_cond_mem_for_multi_obj or batch_size <= 1
         )
 
         # set start index, end index, and processing order
         if start_frame_idx is None:
-            # default: start from the earliest frame with input points
             start_frame_idx = min(output_dict["cond_frame_outputs"])
+        
         if max_frame_num_to_track is None:
-            # default: track all the frames in the video
             max_frame_num_to_track = num_frames
+
         if reverse:
             end_frame_idx = max(start_frame_idx - max_frame_num_to_track, 0)
             if start_frame_idx > 0:
                 processing_order = range(start_frame_idx, end_frame_idx - 1, -1)
             else:
-                processing_order = []  # skip reverse tracking if starting from frame 0
+                processing_order = []
+            direction_str = "Backward"
         else:
-            end_frame_idx = min(
-                start_frame_idx + max_frame_num_to_track, num_frames - 1
-            )
+            end_frame_idx = min(start_frame_idx + max_frame_num_to_track, num_frames - 1)
             processing_order = range(start_frame_idx, end_frame_idx + 1)
+            direction_str = "Forward"
 
-        for frame_idx in tqdm(processing_order, desc="propagate in video"):
-            # We skip those frames already in consolidated outputs (these are frames
-            # that received input clicks or mask). Note that we cannot directly run
-            # batched forward on them via `_run_single_frame_inference` because the
-            # number of clicks on each object might be different.
+        # Show direction and the frame range being processed
+        pbar_desc = f"SAM2 {direction_str} [{start_frame_idx} -> {end_frame_idx}]"
+        
+        for frame_idx in tqdm(processing_order, desc=pbar_desc, leave=False):
             if frame_idx in consolidated_frame_inds["cond_frame_outputs"]:
                 storage_key = "cond_frame_outputs"
                 current_out = output_dict[storage_key][frame_idx]
                 pred_masks = current_out["pred_masks"]
                 if clear_non_cond_mem:
-                    # clear non-conditioning memory of the surrounding frames
                     self._clear_non_cond_mem_around_input(inference_state, frame_idx)
             elif frame_idx in consolidated_frame_inds["non_cond_frame_outputs"]:
                 storage_key = "non_cond_frame_outputs"
@@ -4348,18 +4372,11 @@ class SAM2VideoPredictor(SAM2Base):
                     run_mem_encoder=True,
                 )
                 output_dict[storage_key][frame_idx] = current_out
-            # Create slices of per-object outputs for subsequent interaction with each
-            # individual object after tracking.
-            self._add_output_per_object(
-                inference_state, frame_idx, current_out, storage_key
-            )
+            
+            self._add_output_per_object(inference_state, frame_idx, current_out, storage_key)
             inference_state["frames_already_tracked"][frame_idx] = {"reverse": reverse}
 
-            # Resize the output mask to the original video resolution (we directly use
-            # the mask scores on GPU for output to avoid any CPU conversion in between)
-            _, video_res_masks = self._get_orig_video_res_output(
-                inference_state, pred_masks
-            )
+            _, video_res_masks = self._get_orig_video_res_output(inference_state, pred_masks)
             yield frame_idx, obj_ids, video_res_masks
 
     def _add_output_per_object(
